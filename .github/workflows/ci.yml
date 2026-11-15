@@ -1,0 +1,66 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      APP_URL: http://localhost:3000
+      LOG_LEVEL: error
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx supabase start
+      - run: npm run db:lint
+      - run: npm run db:test
+      - run: npm run db:types
+      - run: git diff --exit-code -- src/shared/infrastructure/supabase/database.types.ts
+      - run: npm run test:integration
+      - run: npm run test:security
+      - run: npm run contract:lint
+      - run: npm run build
+      - run: node scripts/smoke-foundation.mjs
+      - run: npm run check:security
+      - run: npm audit --audit-level=high
+      - if: always()
+        run: npx supabase stop
+  scans:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned scanners
+        run: |
+          pip install semgrep==1.185.0
+          python scripts/install-scanners.py "$RUNNER_TEMP/scanners"
+          echo "$RUNNER_TEMP/scanners" >> "$GITHUB_PATH"
+      - name: Gitleaks
+        run: gitleaks git --redact --verbose
+      - name: Semgrep
+        run: semgrep scan --error --strict --config p/owasp-top-ten --config p/typescript --config p/react --config p/secrets --metrics off
+      - name: OSV dependency scan
+        run: osv-scanner scan source --lockfile package-lock.json

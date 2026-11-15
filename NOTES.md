@@ -7,13 +7,13 @@
 ## Current status
 
 - **Fase:** 1 — backend + banco de dados (frontend é a fase 2).
-- **Onda atual:** nenhuma iniciada. Próxima: **Onda 0 — Fundação**.
+- **Onda atual:** **Onda 0 — Fundação concluída ✅**. Próxima: **Onda 1 — Banco: núcleo multi-tenant + RLS**.
 - **Pronto antes da Onda 0 (2026-11-15):** spec, security-baseline, ADRs 0001–0004, contrato
   OpenAPI v1 e configuração do Claude Code (`.claude/`, `.mcp.json`).
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
-| 0 | Fundação | — | — | ⬜ |
+| 0 | Fundação | — | — | ✅ |
 | 1 | Banco — núcleo multi-tenant + RLS | 0 | — | ⬜ |
 | 2 | Banco — auditoria e funções técnicas | 1 | — | ⬜ |
 | 3 | Identity (login, sessão, guards, rate limit, bootstrap CEO) | 2 | — | ⬜ |
@@ -71,3 +71,28 @@ As que mais mudam o plano:
   - Estrutura corrigida: `.mcp.json` movido de `.claude/` para a raiz; `hooks/` e `skills/`
     estavam aninhados em `.claude/agents/`.
   - O lint do contrato com Redocly fica para `npm run contract:lint` (Onda 0).
+
+- **2026-11-15** — Onda 0 na branch `feat/wave-0`:
+  - Next.js 16.4.6, Node 24, TypeScript strict, ESLint/Prettier, Vitest e scripts canônicos.
+  - Health público, headers, Origin no proxy e wrapper, renovação server-only, problem+json,
+    limite de 16 KiB por stream, env Zod e pino com redação.
+  - Supabase CLI 3.1.0 e Postgres 17 locais iniciados com config endurecido; pgTAP e tipos gerados.
+  - `npm run verify` verde: 14 unitários, 1 integração, 12 segurança e 2 pgTAP.
+    Smoke HTTP de produção verde. `npm ci` e `npm audit` sem vulnerabilidades.
+  - Gitleaks histórico, Semgrep (290 regras), OSV e actionlint sem achados. Revisões de contrato
+    e OWASP aprovadas. Redocly válido, com três avisos prévios (localhost e required em not).
+  - CI com Actions por SHA, scanners por versão/checksum, token somente leitura e Dependabot.
+    Resultado remoto só pode ser confirmado após push/PR; nenhum push foi feito.
+  - Contrato 1.0.1 explicita ativação do rate limit do health na Onda 3, depois da função da Onda 2.
+  - Arquivo de configuração npm criado manualmente pelo usuário; `npm config get` confirmou
+    `save-exact=true` e `engine-strict=true`. Onda fechada ✅ após nova execução de todos os
+    gates (`npm run verify`), smoke HTTP e npm audit sem vulnerabilidades.
+    A inclusão desse arquivo no stage foi feita pelo usuário, devido ao bloqueio do hook.
+
+### Armadilhas da fundação
+
+- CLI Supabase 3 usa alvo local por padrão e removeu `--local` de `db lint` e `gen types`.
+- O seed fica desativado até a Onda 1 criar dados fictícios.
+- `db:types` formata com Prettier antes de gravar, para regeneração sem diff de whitespace.
+- ESLint 9.39.5 respeita peers dos plugins Next; override minimatch 11.0.8 elimina o advisory
+  do parser TypeScript. Os binários gitleaks/OSV são verificados por SHA-256 no instalador.

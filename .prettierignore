@@ -1,0 +1,14 @@
+node_modules/
+.next/
+coverage/
+venv/
+.claude/
+.mcp.json
+AGENTS.md
+CLAUDE.md
+NOTES.md
+docs/
+contracts/
+package-lock.json
+next-env.d.ts
+supabase/.temp/

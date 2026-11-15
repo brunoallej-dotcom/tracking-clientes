@@ -33,3 +33,7 @@ venv
 .DS_Store
 *.log
 npm-debug.log*
+
+# Local tooling
+.semgrep/
+.supabase/
