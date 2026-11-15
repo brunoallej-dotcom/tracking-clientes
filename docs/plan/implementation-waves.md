@@ -9,7 +9,7 @@
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
-| 0 | Fundação: scaffold Next.js + tooling, kit HTTP, `proxy.ts`, headers, CI DevSecOps, `config.toml` endurecido, `GET /health` | — | — | ⬜ |
+| 0 | Fundação: scaffold Next.js + tooling, kit HTTP, `proxy.ts`, headers, CI DevSecOps, `config.toml` endurecido, `GET /health` | — | — | 🟡 |
 | 1 | Banco — núcleo multi-tenant: `clients`, `profiles`, `projects`, `project_stages`, helpers de RLS, policies, grants, trigger de auth, seed, pgTAP | 0 | — | ⬜ |
 | 2 | Banco — auditoria e funções técnicas: `audit_events`, `project_internal_notes`, rate limit, `admin_*`, pgTAP | 1 | — | ⬜ |
 | 3 | Identity: login, logout, `/me`, troca de senha, pipeline de guards, rate limiter, bootstrap de CEO | 2 | — | ⬜ |
@@ -35,6 +35,11 @@ o contrato OpenAPI v1 e a configuração do Claude Code (`.claude/`). A Onda 0 p
 
 ## Onda 0 — Fundação
 
+**Validação local (2026-11-15):** `npm run verify`, smoke HTTP de produção, npm audit,
+gitleaks, Semgrep, OSV e actionlint verdes. Revisões de contrato e OWASP aprovadas.
+Aguardando apenas criação manual do arquivo de configuração npm, bloqueado pelo hook
+`aisac secrets-guard`; status 🟡 até essa pendência. CI remoto aguardará push/PR.
+
 - **Objetivo**: ter um projeto Next.js executável, com tooling, CI DevSecOps, kit HTTP seguro e o primeiro endpoint público.
 - **Escopo (slices/arquivos)**:
   - Config do projeto: `package.json` (scripts canônicos, versões exatas), `.npmrc` (`save-exact=true`),
@@ -44,7 +49,9 @@ o contrato OpenAPI v1 e a configuração do Claude Code (`.claude/`). A Onda 0 p
     (request id, refresh de sessão, checagem de `Origin`).
   - `src/shared/http/**` (problem+json, wrapper de rota com a ordem fixa da spec §6.3, limite de
     corpo, mapeador de erros) e `src/shared/infrastructure/{env,logger}.ts` (Zod + pino com redação).
-  - `src/app/api/v1/health/route.ts`.
+  - `src/app/api/v1/health/route.ts`. A porta de rate limit fica pronta nesta onda; o adapter
+    Postgres e a quota de 60/min/IP do health são conectados na Onda 3, após a função da Onda 2
+    (`x-rate-limit-wave: 3` no contrato). Até lá, segue a política fail-open de E27.
   - `supabase/config.toml` (`supabase init` + signup off, JWT 900 s, rotação de refresh,
     senha ≥ 12, `api.schemas = ["public"]`).
   - CI e qualidade: `.github/workflows/ci.yml` (Actions pinadas por SHA, `permissions: contents: read`,

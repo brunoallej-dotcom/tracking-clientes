@@ -243,3 +243,16 @@ Toda resposta `/api/*` traz:
 | O rate limit da API não cobre o caminho direto ao PostgREST | Idem | Signup off; sem escrita para clientes; limites nativos do Supabase Auth. |
 | Um JWT de acesso continua válido por até 15 min depois de um reset de senha | Custo de checar a sessão a cada query | Sessões revogadas (o refresh falha); a desativação é imediata pela RLS. |
 | Sem WAF dedicado no plano Hobby da Vercel | Custo | Vercel Firewall no plano Pro (recomendado para produção). |
+
+### Fundação implementada (Onda 0)
+
+O health público retorna somente status de liveness. SEC-08/09/11 cobrem headers, CSRF e erros;
+o smoke também passa pelo servidor Next real. O proxy correlaciona, verifica Origin e renova
+cookies; a autorização fica no handler. O wrapper repete Origin como defesa em profundidade.
+IDs externos são limitados a 64 caracteres alfanuméricos, hífen e sublinhado; os demais são
+substituídos. O JSON tem limite em bytes inclusive sem Content-Length. Logs usam códigos do
+catálogo sem copiar mensagens externas que podem conter PII.
+
+O adapter Postgres do rate limit é conectado na Onda 3, depois da função da Onda 2. Nesta
+fundação o health segue fail-open de E27 com registro da indisponibilidade. Acesso privado
+sem adapter de identidade permanece negado. Não há tabelas públicas nem mutações novas.
