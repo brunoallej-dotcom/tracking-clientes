@@ -9,7 +9,7 @@
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
-| 0 | Fundação: scaffold Next.js + tooling, kit HTTP, `proxy.ts`, headers, CI DevSecOps, `config.toml` endurecido, `GET /health` | — | — | 🟡 |
+| 0 | Fundação: scaffold Next.js + tooling, kit HTTP, `proxy.ts`, headers, CI DevSecOps, `config.toml` endurecido, `GET /health` | — | — | ✅ |
 | 1 | Banco — núcleo multi-tenant: `clients`, `profiles`, `projects`, `project_stages`, helpers de RLS, policies, grants, trigger de auth, seed, pgTAP | 0 | — | ⬜ |
 | 2 | Banco — auditoria e funções técnicas: `audit_events`, `project_internal_notes`, rate limit, `admin_*`, pgTAP | 1 | — | ⬜ |
 | 3 | Identity: login, logout, `/me`, troca de senha, pipeline de guards, rate limiter, bootstrap de CEO | 2 | — | ⬜ |
@@ -37,8 +37,9 @@ o contrato OpenAPI v1 e a configuração do Claude Code (`.claude/`). A Onda 0 p
 
 **Validação local (2026-11-15):** `npm run verify`, smoke HTTP de produção, npm audit,
 gitleaks, Semgrep, OSV e actionlint verdes. Revisões de contrato e OWASP aprovadas.
-Aguardando apenas criação manual do arquivo de configuração npm, bloqueado pelo hook
-`aisac secrets-guard`; status 🟡 até essa pendência. CI remoto aguardará push/PR.
+Arquivo de configuração npm criado pelo usuário e confirmado com `npm config get`
+(`save-exact=true`, `engine-strict=true`); gates completos e smoke reexecutados com exit 0.
+**Onda concluída ✅.** A CI remota será confirmada no primeiro push/PR; nenhum push nesta sessão.
 
 - **Objetivo**: ter um projeto Next.js executável, com tooling, CI DevSecOps, kit HTTP seguro e o primeiro endpoint público.
 - **Escopo (slices/arquivos)**:

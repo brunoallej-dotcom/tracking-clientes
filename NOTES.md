@@ -7,14 +7,13 @@
 ## Current status
 
 - **Fase:** 1 — backend + banco de dados (frontend é a fase 2).
-- **Onda atual:** **Onda 0 — Fundação**, implementação e gates locais prontos.
-  Aguarda somente o arquivo de configuração npm protegido pelo hook; próxima implementação: Onda 1.
+- **Onda atual:** **Onda 0 — Fundação concluída ✅**. Próxima: **Onda 1 — Banco: núcleo multi-tenant + RLS**.
 - **Pronto antes da Onda 0 (2026-11-15):** spec, security-baseline, ADRs 0001–0004, contrato
   OpenAPI v1 e configuração do Claude Code (`.claude/`, `.mcp.json`).
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
-| 0 | Fundação | — | — | 🟡 |
+| 0 | Fundação | — | — | ✅ |
 | 1 | Banco — núcleo multi-tenant + RLS | 0 | — | ⬜ |
 | 2 | Banco — auditoria e funções técnicas | 1 | — | ⬜ |
 | 3 | Identity (login, sessão, guards, rate limit, bootstrap CEO) | 2 | — | ⬜ |
@@ -85,9 +84,10 @@ As que mais mudam o plano:
   - CI com Actions por SHA, scanners por versão/checksum, token somente leitura e Dependabot.
     Resultado remoto só pode ser confirmado após push/PR; nenhum push foi feito.
   - Contrato 1.0.1 explicita ativação do rate limit do health na Onda 3, depois da função da Onda 2.
-  - Pendência externa: o hook `aisac secrets-guard` bloqueia o arquivo de configuração npm.
-    Foi solicitada sua criação manual com `save-exact=true` e `engine-strict=true`. A onda
-    permanece 🟡 até esse arquivo entrar; não há pendência nos gates executáveis.
+  - Arquivo de configuração npm criado manualmente pelo usuário; `npm config get` confirmou
+    `save-exact=true` e `engine-strict=true`. Onda fechada ✅ após nova execução de todos os
+    gates (`npm run verify`), smoke HTTP e npm audit sem vulnerabilidades.
+    A inclusão desse arquivo no stage foi feita pelo usuário, devido ao bloqueio do hook.
 
 ### Armadilhas da fundação
 
