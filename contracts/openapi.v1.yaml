@@ -1,0 +1,2412 @@
+openapi: 3.1.0
+info:
+  title: Tracking Clientes API
+  version: 1.0.0
+  summary: API do rastreador de entregas por cliente (painel CEO + painel do cliente).
+  license:
+    name: Proprietário — uso interno
+    identifier: LicenseRef-Proprietary
+  description: |
+    Contrato **API-first** do backend. Comportamento e regras: `docs/specs/client-delivery-tracking.md`.
+    Controles de segurança: `docs/specs/security-baseline.md`. O código segue este contrato,
+    nunca o contrário. Mudança incompatível = nova versão (`/api/v2`) + nota de compatibilidade.
+
+    ## Autenticação
+    Sessão do Supabase Auth em cookies `HttpOnly; Secure; SameSite=Lax`, definidos por
+    `POST /auth/login`. O navegador nunca fala direto com o Supabase. Toda rota exige sessão,
+    exceto as marcadas com `security: []`.
+
+    ## Autorização
+    - `x-roles` indica os papéis aceitos (`ceo`, `client` ou `public`).
+    - Rotas `/admin/*`: só `ceo`. Rotas `/portal/*`: `ceo` e `client`.
+    - O tenant do usuário `client` vem do perfil no servidor. Nenhum parâmetro escolhe o cliente no portal.
+    - Recurso fora do escopo do usuário → `404`. Papel sem acesso à rota → `403`.
+    - Com `mustChangePassword = true`, só `GET /me`, `POST /auth/password` e `POST /auth/logout`
+      respondem; o resto retorna `403 PASSWORD_CHANGE_REQUIRED`.
+
+    ## Requisições
+    - Mutações (`POST`, `PUT`, `PATCH`, `DELETE`) exigem o header `Origin` igual à origem da
+      aplicação; senão → `403 ORIGIN_NOT_ALLOWED`.
+    - Corpo JSON (`Content-Type: application/json`) de até 16 KB. Campos desconhecidos são
+      rejeitados (`400`).
+    - Paginação por `limit` (1–100, padrão 20) + `cursor` opaco. Resposta `{ items, nextCursor }`.
+
+    ## Respostas
+    - Toda resposta traz `X-Request-Id`, `Cache-Control: no-store` e os headers de segurança.
+    - Erros seguem a RFC 9457 (`application/problem+json`) com `code` estável (ver `ErrorCode`)
+      e `requestId`. Nunca contêm stack trace, SQL ou detalhes internos.
+
+    ## Extensões
+    - `x-wave`: onda de implementação (`docs/plan/implementation-waves.md`).
+    - `x-roles`: papéis autorizados.
+    - `x-rate-limit`: limite aplicado à operação.
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Desenvolvimento local
+  - url: https://{host}/api/v1
+    description: Staging / produção
+    variables:
+      host:
+        default: seu-dominio.com.br
+        description: Domínio da aplicação (a definir).
+security:
+  - sessionCookie: []
+tags:
+  - name: Health
+    description: Monitoramento (público).
+  - name: Auth
+    description: Login, logout e troca de senha.
+  - name: Me
+    description: Dados do usuário autenticado.
+  - name: Portal
+    description: Painel do cliente — rastreamento visível ao cliente (e aos CEOs, como preview).
+  - name: Admin - Clients
+    description: Painel CEO — clientes (tenants).
+  - name: Admin - Users
+    description: Painel CEO — logins dos clientes.
+  - name: Admin - Projects
+    description: Painel CEO — projetos e ciclo de vida.
+  - name: Admin - Stages
+    description: Painel CEO — montagem e avanço do fluxo de entrega.
+  - name: Admin - Notes
+    description: Painel CEO — notas internas (nunca visíveis ao cliente).
+  - name: Admin - Audit
+    description: Painel CEO — trilha de auditoria.
+  - name: Admin - Templates
+    description: Painel CEO — templates de fluxo (opcional, Onda 10).
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Liveness da API
+      description: Exceção pública explícita. Não expõe versão, dependências nem detalhes internos.
+      security: []
+      x-wave: 0
+      x-roles: [public]
+      x-rate-limit: 60/min por IP
+      responses:
+        '200':
+          description: API no ar.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/login:
+    post:
+      operationId: loginWithPassword
+      tags: [Auth]
+      summary: Login com e-mail e senha (RF-01)
+      description: |
+        Define os cookies de sessão. Qualquer falha de credencial (e-mail inexistente, senha errada,
+        usuário ou cliente inativo) retorna a mesma resposta `401 INVALID_CREDENTIALS`.
+      security: []
+      x-wave: 3
+      x-roles: [public]
+      x-rate-limit: 5/15min por (IP, e-mail) e 20/15min por IP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Autenticado. Cookies de sessão definidos.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      summary: Logout (RF-02)
+      description: Revoga a sessão atual e limpa os cookies. Idempotente — sem sessão também retorna 204.
+      security:
+        - sessionCookie: []
+        - {}
+      x-wave: 3
+      x-roles: [ceo, client, public]
+      responses:
+        '204':
+          description: Sessão encerrada.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/password:
+    post:
+      operationId: changeOwnPassword
+      tags: [Auth]
+      summary: Trocar a própria senha (RF-04)
+      description: |
+        Permitido mesmo com `mustChangePassword = true`. Em caso de sucesso, zera
+        `mustChangePassword` e revoga as demais sessões do usuário.
+      x-wave: 3
+      x-roles: [ceo, client]
+      x-rate-limit: 5/15min por usuário
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: Senha alterada.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /me:
+    get:
+      operationId: getMe
+      tags: [Me]
+      summary: Dados do usuário autenticado (RF-03)
+      description: Permitido mesmo com `mustChangePassword = true`.
+      x-wave: 3
+      x-roles: [ceo, client]
+      responses:
+        '200':
+          description: Usuário autenticado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /portal/projects:
+    get:
+      operationId: listPortalProjects
+      tags: [Portal]
+      summary: Listar projetos visíveis no painel do cliente (RF-30)
+      description: |
+        Usuário `client`: só projetos do próprio cliente com status `active` ou `completed`.
+        CEO: todos os projetos (preview). Não existe parâmetro para escolher o cliente.
+      x-wave: 8
+      x-roles: [ceo, client]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de projetos.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PortalProjectPage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /portal/projects/{projectId}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      operationId: getPortalProject
+      tags: [Portal]
+      summary: Rastreamento de um projeto (RF-31)
+      description: |
+        Linha do tempo com o estado de cada fase. O DTO contém só campos publicáveis: nunca notas
+        internas, autor da conclusão, motivo de reabertura nem e-mails. O CEO recebe o mesmo DTO
+        que o cliente veria.
+      x-wave: 8
+      x-roles: [ceo, client]
+      responses:
+        '200':
+          description: Rastreamento do projeto.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PortalProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients:
+    get:
+      operationId: listClients
+      tags: [Admin - Clients]
+      summary: Listar clientes (RF-11)
+      x-wave: 4
+      x-roles: [ceo]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, inactive]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de clientes.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientPage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createClient
+      tags: [Admin - Clients]
+      summary: Cadastrar cliente (RF-10)
+      x-wave: 4
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientRequest'
+      responses:
+        '201':
+          description: Cliente criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Client'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{clientId}:
+    parameters:
+      - $ref: '#/components/parameters/ClientId'
+    get:
+      operationId: getClient
+      tags: [Admin - Clients]
+      summary: Detalhar cliente com usuários e projetos (RF-11)
+      x-wave: 4
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Cliente.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateClient
+      tags: [Admin - Clients]
+      summary: Editar ou desativar/reativar cliente (RF-12)
+      description: |
+        `isActive: false` bloqueia imediatamente todos os usuários do cliente (RLS), revoga as
+        sessões e bane o login no Supabase Auth. `isActive: true` remove o ban dos usuários ativos.
+      x-wave: 4
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientRequest'
+      responses:
+        '200':
+          description: Cliente atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Client'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{clientId}/users:
+    parameters:
+      - $ref: '#/components/parameters/ClientId'
+    post:
+      operationId: createClientUser
+      tags: [Admin - Users]
+      summary: Criar login de usuário do cliente (RF-13)
+      description: |
+        Cria o usuário no Supabase Auth (e-mail confirmado) e o perfil, de forma atômica, com
+        `mustChangePassword = true`. Sem `temporaryPassword`, o servidor gera uma senha forte e a
+        devolve **uma única vez** em `temporaryPassword`.
+      x-wave: 4
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientUserRequest'
+      responses:
+        '201':
+          description: Usuário criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateClientUserResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      operationId: updateClientUser
+      tags: [Admin - Users]
+      summary: Editar ou desativar/reativar usuário do cliente (RF-14)
+      description: Atua só sobre usuários `client`. Alvo CEO ou inexistente → 404.
+      x-wave: 4
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: Usuário atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/users/{userId}/password-reset:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: resetClientUserPassword
+      tags: [Admin - Users]
+      summary: Resetar senha de usuário do cliente (RF-15)
+      description: |
+        Define uma senha temporária (informada ou gerada), liga `mustChangePassword` e revoga todas
+        as sessões do usuário. A senha gerada é devolvida uma única vez.
+      x-wave: 4
+      x-roles: [ceo]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '200':
+          description: Senha redefinida.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordResetResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/projects:
+    get:
+      operationId: listProjects
+      tags: [Admin - Projects]
+      summary: Listar projetos (RF-21)
+      x-wave: 5
+      x-roles: [ceo]
+      parameters:
+        - name: clientId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ProjectStatus'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de projetos.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectPage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createProject
+      tags: [Admin - Projects]
+      summary: Criar projeto em draft (RF-20, RF-51)
+      description: |
+        Cria o projeto e as fases atomicamente, em `draft`. `stages` e `templateId` (Onda 10) são
+        mutuamente exclusivos. `clientId` ou `templateId` inexistente → 404.
+      x-wave: 5
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+      responses:
+        '201':
+          description: Projeto criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      operationId: getProject
+      tags: [Admin - Projects]
+      summary: Detalhar projeto com fluxo completo (RF-21)
+      x-wave: 5
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Projeto.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateProject
+      tags: [Admin - Projects]
+      summary: Editar nome/descrição do projeto (RF-22)
+      x-wave: 5
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProjectRequest'
+      responses:
+        '200':
+          description: Projeto atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/publish:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      operationId: publishProject
+      tags: [Admin - Projects]
+      summary: Publicar projeto — draft → active (RF-23)
+      description: Exige ao menos 1 fase. Torna o projeto visível ao cliente. Sem corpo.
+      x-wave: 5
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Projeto publicado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/archive:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      operationId: archiveProject
+      tags: [Admin - Projects]
+      summary: Arquivar projeto — active|completed → archived (RF-23)
+      description: Projeto arquivado some do painel do cliente e vira somente leitura. Sem corpo.
+      x-wave: 5
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Projeto arquivado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/unarchive:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      operationId: unarchiveProject
+      tags: [Admin - Projects]
+      summary: Desarquivar projeto — archived → active|completed (RF-23)
+      description: O status resultante é derivado das fases (todas concluídas → `completed`). Sem corpo.
+      x-wave: 5
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Projeto desarquivado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/stages:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      operationId: addStage
+      tags: [Admin - Stages]
+      summary: Adicionar fase ao fluxo (RF-24)
+      description: |
+        Sem `position`, a fase entra no fim. `position` precisa ser maior que a da última fase
+        concluída (`409 STAGE_LOCKED`). Máximo de 50 fases (`409 STAGE_LIMIT_REACHED`). Em projeto
+        `completed`, o projeto volta a `active`. Retorna o fluxo atualizado.
+      x-wave: 6
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddStageRequest'
+      responses:
+        '201':
+          description: Fase adicionada; retorna o projeto atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/stages/order:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    put:
+      operationId: reorderStages
+      tags: [Admin - Stages]
+      summary: Reordenar fases (RF-24)
+      description: |
+        `stageIds` deve conter exatamente todas as fases do projeto, na nova ordem (senão → `400`).
+        As fases concluídas devem manter suas posições (senão → `409 STAGE_LOCKED`).
+      x-wave: 6
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderStagesRequest'
+      responses:
+        '200':
+          description: Fluxo reordenado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/stages/{stageId}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/StageId'
+    patch:
+      operationId: updateStage
+      tags: [Admin - Stages]
+      summary: Editar texto/previsão de uma fase (RF-24)
+      description: Permitido também em fases concluídas (correção de texto, auditada). `null` limpa o campo.
+      x-wave: 6
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateStageRequest'
+      responses:
+        '200':
+          description: Fase atualizada.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: removeStage
+      tags: [Admin - Stages]
+      summary: Remover fase não concluída (RF-24)
+      description: |
+        Fase concluída → `409 STAGE_LOCKED`. Última fase de projeto fora de `draft` →
+        `409 PROJECT_REQUIRES_STAGE`. Se sobrarem só fases concluídas, o projeto vira `completed`.
+      x-wave: 6
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Fase removida; retorna o projeto atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/stages/{stageId}/complete:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/StageId'
+    post:
+      operationId: completeStage
+      tags: [Admin - Stages]
+      summary: Concluir a fase atual — faz o fluxo andar (RF-25)
+      description: |
+        Só a fase atual de um projeto `active`. Concorrência: entre dois CEOs simultâneos, só um
+        vence; o outro recebe `409 STAGE_ALREADY_COMPLETED`. Concluir a última fase leva o projeto
+        a `completed`. Gera a auditoria `stage.completed` com o autor. Sem corpo.
+      x-wave: 7
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Fase concluída; retorna o projeto atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/stages/{stageId}/reopen:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/StageId'
+    post:
+      operationId: reopenStage
+      tags: [Admin - Stages]
+      summary: Reabrir a última fase concluída (RF-26)
+      description: |
+        Só a última fase concluída (`409 NOT_LAST_COMPLETED_STAGE`). Projeto `completed` volta a
+        `active`. O `reason` fica apenas na auditoria (interna).
+      x-wave: 7
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReopenStageRequest'
+      responses:
+        '200':
+          description: Fase reaberta; retorna o projeto atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProjectDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/projects/{projectId}/notes:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      operationId: listInternalNotes
+      tags: [Admin - Notes]
+      summary: Listar notas internas do projeto (RF-40)
+      x-wave: 9
+      x-roles: [ceo]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de notas, mais recentes primeiro.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalNotePage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createInternalNote
+      tags: [Admin - Notes]
+      summary: Criar nota interna (RF-40)
+      description: Notas são imutáveis na v1. Um `stageId` de outro projeto → 404.
+      x-wave: 9
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInternalNoteRequest'
+      responses:
+        '201':
+          description: Nota criada.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalNote'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/audit-events:
+    get:
+      operationId: listAuditEvents
+      tags: [Admin - Audit]
+      summary: Consultar a trilha de auditoria (RF-41)
+      x-wave: 9
+      x-roles: [ceo]
+      parameters:
+        - name: projectId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: clientId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: actorId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: action
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/AuditAction'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de eventos, mais recentes primeiro.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/flow-templates:
+    get:
+      operationId: listFlowTemplates
+      tags: [Admin - Templates]
+      summary: Listar templates de fluxo (RF-50)
+      x-wave: 10
+      x-roles: [ceo]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de templates.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlowTemplatePage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createFlowTemplate
+      tags: [Admin - Templates]
+      summary: Criar template de fluxo (RF-50)
+      x-wave: 10
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFlowTemplateRequest'
+      responses:
+        '201':
+          description: Template criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlowTemplate'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/flow-templates/{templateId}:
+    parameters:
+      - $ref: '#/components/parameters/TemplateId'
+    get:
+      operationId: getFlowTemplate
+      tags: [Admin - Templates]
+      summary: Detalhar template de fluxo (RF-50)
+      x-wave: 10
+      x-roles: [ceo]
+      responses:
+        '200':
+          description: Template.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlowTemplate'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateFlowTemplate
+      tags: [Admin - Templates]
+      summary: Editar template de fluxo (RF-50)
+      description: '`stages`, quando enviado, substitui a lista inteira. Projetos já criados não mudam (snapshot).'
+      x-wave: 10
+      x-roles: [ceo]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFlowTemplateRequest'
+      responses:
+        '200':
+          description: Template atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlowTemplate'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteFlowTemplate
+      tags: [Admin - Templates]
+      summary: Remover template de fluxo (RF-50)
+      description: Não afeta projetos criados a partir dele.
+      x-wave: 10
+      x-roles: [ceo]
+      responses:
+        '204':
+          description: Template removido.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sb-auth-token
+      description: |
+        Cookie de sessão do Supabase Auth gerenciado pelo `@supabase/ssr` (nome real
+        `sb-<project-ref>-auth-token`, possivelmente fragmentado em `.0`, `.1`). Flags:
+        `HttpOnly; Secure; SameSite=Lax; Path=/`. Nunca acessível por JavaScript.
+
+  headers:
+    XRequestId:
+      description: ID de correlação da requisição (propagado nos logs e na auditoria).
+      schema:
+        type: string
+        maxLength: 128
+    RetryAfter:
+      description: Segundos até a próxima tentativa permitida.
+      schema:
+        type: integer
+        minimum: 1
+    SetCookie:
+      description: Cookies de sessão (`HttpOnly; Secure; SameSite=Lax`).
+      schema:
+        type: string
+
+  parameters:
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    StageId:
+      name: stageId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    ClientId:
+      name: clientId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    TemplateId:
+      name: templateId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Cursor opaco devolvido em `nextCursor`.
+      schema:
+        type: string
+        maxLength: 256
+        pattern: '^[A-Za-z0-9_-]+$'
+
+  responses:
+    ValidationFailed:
+      description: Entrada inválida (`VALIDATION_FAILED`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: about:blank
+            title: Requisição inválida
+            status: 400
+            code: VALIDATION_FAILED
+            requestId: 01JD7Z3K9Q6F2X8M4N5P7R2S1T
+            errors:
+              - path: name
+                message: Deve ter entre 2 e 120 caracteres.
+    Unauthenticated:
+      description: Sessão ausente, expirada, usuário ou cliente inativo (`UNAUTHENTICATED`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InvalidCredentials:
+      description: |
+        Credenciais inválidas (`INVALID_CREDENTIALS`) — mensagem genérica, sem indicar o motivo.
+        Em rotas autenticadas, também pode ser `UNAUTHENTICATED`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        Acesso negado: papel sem permissão (`FORBIDDEN`), troca de senha pendente
+        (`PASSWORD_CHANGE_REQUIRED`) ou origem não permitida em mutação (`ORIGIN_NOT_ALLOWED`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Recurso inexistente ou fora do escopo do usuário (`NOT_FOUND`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Violação de regra de negócio ou de estado (ver `ErrorCode`, status 409).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: about:blank
+            title: A fase informada não é a fase atual
+            status: 409
+            code: STAGE_NOT_CURRENT
+            requestId: 01JD7Z3K9Q6F2X8M4N5P7R2S1T
+    PayloadTooLarge:
+      description: Corpo maior que 16 KB (`PAYLOAD_TOO_LARGE`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: '`Content-Type` diferente de `application/json` (`UNSUPPORTED_MEDIA_TYPE`).'
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: Limite de requisições excedido (`RATE_LIMITED`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: Erro inesperado (`INTERNAL_ERROR`). Detalhes só no log do servidor, pelo `requestId`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: Dependência indisponível — Supabase Auth ou armazenamento de rate limit (`SERVICE_UNAVAILABLE`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    # ---------- Primitivos ----------
+    Uuid:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+      description: ISO 8601 em UTC.
+    NullableTimestamp:
+      oneOf:
+        - $ref: '#/components/schemas/Timestamp'
+        - type: 'null'
+    CalendarDate:
+      type: string
+      format: date
+      description: Data sem horário (`YYYY-MM-DD`).
+    NullableCalendarDate:
+      oneOf:
+        - $ref: '#/components/schemas/CalendarDate'
+        - type: 'null'
+    Title:
+      type: string
+      minLength: 2
+      maxLength: 120
+      description: Texto puro, após trim. Caracteres de controle são rejeitados.
+    Description:
+      type: string
+      maxLength: 2000
+      description: Texto puro (renderizado como texto, nunca HTML). Permite `\n` e `\t`.
+    NullableDescription:
+      oneOf:
+        - $ref: '#/components/schemas/Description'
+        - type: 'null'
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+      description: Normalizado para minúsculas no servidor.
+    TemporaryPassword:
+      type: string
+      minLength: 12
+      maxLength: 128
+      writeOnly: true
+    NextCursor:
+      oneOf:
+        - type: string
+          maxLength: 256
+        - type: 'null'
+
+    # ---------- Enums ----------
+    Role:
+      type: string
+      enum: [ceo, client]
+    ProjectStatus:
+      type: string
+      enum: [draft, active, completed, archived]
+    StageState:
+      type: string
+      enum: [completed, current, upcoming]
+      description: |
+        Derivado: `completed` se concluída; `current` se for a primeira não concluída de um projeto
+        `active`; senão `upcoming`.
+    AuditAction:
+      type: string
+      pattern: '^[a-z_]+\.[a-z_]+$'
+      maxLength: 64
+      examples:
+        - stage.completed
+        - project.published
+        - user.created
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - UNAUTHENTICATED
+        - INVALID_CREDENTIALS
+        - FORBIDDEN
+        - PASSWORD_CHANGE_REQUIRED
+        - ORIGIN_NOT_ALLOWED
+        - NOT_FOUND
+        - CLIENT_NAME_TAKEN
+        - CLIENT_INACTIVE
+        - EMAIL_ALREADY_REGISTERED
+        - INVALID_STATUS_TRANSITION
+        - PROJECT_NOT_ACTIVE
+        - PROJECT_ARCHIVED
+        - PROJECT_HAS_NO_STAGES
+        - PROJECT_REQUIRES_STAGE
+        - STAGE_NOT_CURRENT
+        - STAGE_ALREADY_COMPLETED
+        - NOT_LAST_COMPLETED_STAGE
+        - STAGE_LOCKED
+        - STAGE_LIMIT_REACHED
+        - TEMPLATE_NAME_TAKEN
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - RATE_LIMITED
+        - INTERNAL_ERROR
+        - SERVICE_UNAVAILABLE
+
+    # ---------- Erros ----------
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details.
+      required: [type, title, status, code, requestId]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: '`about:blank` ou URI de documentação do problema.'
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        detail:
+          type: string
+          description: Explicação segura para o usuário. Nunca contém SQL, stack trace ou dados de outro tenant.
+        requestId:
+          type: string
+        errors:
+          type: array
+          description: Presente em `VALIDATION_FAILED`.
+          items:
+            $ref: '#/components/schemas/FieldError'
+    FieldError:
+      type: object
+      required: [path, message]
+      properties:
+        path:
+          type: string
+          description: Caminho do campo (ex.. `stages.2.title`).
+        message:
+          type: string
+
+    # ---------- Referências ----------
+    ClientRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+    UserRef:
+      type: object
+      required: [id, fullName]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        fullName:
+          type: string
+    StageRef:
+      type: object
+      required: [id, title]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        title:
+          type: string
+    Progress:
+      type: object
+      required: [completed, total]
+      properties:
+        completed:
+          type: integer
+          minimum: 0
+        total:
+          type: integer
+          minimum: 0
+
+    # ---------- Health ----------
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    # ---------- Auth / Me ----------
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          writeOnly: true
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          minLength: 1
+          maxLength: 128
+          writeOnly: true
+        newPassword:
+          type: string
+          minLength: 12
+          maxLength: 128
+          writeOnly: true
+          description: 12–128 caracteres, diferente da atual e fora da lista de senhas comuns.
+    Me:
+      type: object
+      required: [id, fullName, role, client, mustChangePassword]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        fullName:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        client:
+          description: Cliente do usuário; `null` para CEO.
+          oneOf:
+            - $ref: '#/components/schemas/ClientRef'
+            - type: 'null'
+        mustChangePassword:
+          type: boolean
+
+    # ---------- Portal ----------
+    PortalProjectSummary:
+      type: object
+      required: [id, name, status, progress, currentStage, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        progress:
+          $ref: '#/components/schemas/Progress'
+        currentStage:
+          oneOf:
+            - $ref: '#/components/schemas/StageRef'
+            - type: 'null'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    PortalProjectPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PortalProjectSummary'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    PortalStage:
+      type: object
+      description: Somente campos publicáveis ao cliente.
+      required: [id, position, title, description, expectedDate, state, completedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        position:
+          type: integer
+          minimum: 1
+          maximum: 50
+        title:
+          type: string
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        expectedDate:
+          $ref: '#/components/schemas/NullableCalendarDate'
+        state:
+          $ref: '#/components/schemas/StageState'
+        completedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+    PortalProjectDetail:
+      type: object
+      required: [id, name, description, status, client, startedAt, completedAt, progress, stages]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        client:
+          $ref: '#/components/schemas/ClientRef'
+        startedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        completedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        progress:
+          $ref: '#/components/schemas/Progress'
+        stages:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/PortalStage'
+
+    # ---------- Admin: clients & users ----------
+    Client:
+      type: object
+      required: [id, name, isActive, userCount, projectCount, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        isActive:
+          type: boolean
+        userCount:
+          type: integer
+          minimum: 0
+        projectCount:
+          type: integer
+          minimum: 0
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    ClientDetail:
+      allOf:
+        - $ref: '#/components/schemas/Client'
+        - type: object
+          required: [users, projects]
+          properties:
+            users:
+              type: array
+              items:
+                $ref: '#/components/schemas/AdminUser'
+            projects:
+              type: array
+              items:
+                $ref: '#/components/schemas/AdminProjectSummary'
+    ClientPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Client'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    CreateClientRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          $ref: '#/components/schemas/Title'
+    UpdateClientRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          $ref: '#/components/schemas/Title'
+        isActive:
+          type: boolean
+    AdminUser:
+      type: object
+      required: [id, email, fullName, role, clientId, isActive, mustChangePassword, createdAt, lastSignInAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          $ref: '#/components/schemas/Email'
+        fullName:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        clientId:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        isActive:
+          type: boolean
+        mustChangePassword:
+          type: boolean
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        lastSignInAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+    CreateClientUserRequest:
+      type: object
+      additionalProperties: false
+      required: [email, fullName]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        fullName:
+          $ref: '#/components/schemas/Title'
+        temporaryPassword:
+          $ref: '#/components/schemas/TemporaryPassword'
+    CreateClientUserResponse:
+      type: object
+      required: [user]
+      properties:
+        user:
+          $ref: '#/components/schemas/AdminUser'
+        temporaryPassword:
+          type: string
+          readOnly: true
+          description: Presente somente quando a senha foi gerada pelo servidor. Exibir uma única vez; nunca logar.
+    UpdateUserRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        fullName:
+          $ref: '#/components/schemas/Title'
+        isActive:
+          type: boolean
+    PasswordResetRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        temporaryPassword:
+          $ref: '#/components/schemas/TemporaryPassword'
+    PasswordResetResponse:
+      type: object
+      properties:
+        temporaryPassword:
+          type: string
+          readOnly: true
+          description: Presente somente quando a senha foi gerada pelo servidor.
+
+    # ---------- Admin: projects & stages ----------
+    AdminProjectSummary:
+      type: object
+      required: [id, client, name, status, progress, currentStage, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        client:
+          $ref: '#/components/schemas/ClientRef'
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        progress:
+          $ref: '#/components/schemas/Progress'
+        currentStage:
+          oneOf:
+            - $ref: '#/components/schemas/StageRef'
+            - type: 'null'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    AdminProjectPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminProjectSummary'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    AdminStage:
+      type: object
+      required: [id, position, title, description, expectedDate, state, completedAt, completedBy, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        position:
+          type: integer
+          minimum: 1
+          maximum: 50
+        title:
+          type: string
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        expectedDate:
+          $ref: '#/components/schemas/NullableCalendarDate'
+        state:
+          $ref: '#/components/schemas/StageState'
+        completedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        completedBy:
+          description: CEO que concluiu a fase (derivado da auditoria). Nunca exposto no portal.
+          oneOf:
+            - $ref: '#/components/schemas/UserRef'
+            - type: 'null'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    AdminProjectDetail:
+      type: object
+      required: [id, client, name, description, status, startedAt, completedAt, createdAt, updatedAt, progress, stages]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        client:
+          $ref: '#/components/schemas/ClientRef'
+        name:
+          type: string
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        startedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        completedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        progress:
+          $ref: '#/components/schemas/Progress'
+        stages:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/AdminStage'
+    NewStage:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        expectedDate:
+          $ref: '#/components/schemas/NullableCalendarDate'
+    CreateProjectRequest:
+      type: object
+      additionalProperties: false
+      required: [clientId, name]
+      not:
+        required: [stages, templateId]
+      properties:
+        clientId:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        stages:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/NewStage'
+        templateId:
+          description: Onda 10 (opcional). Mutuamente exclusivo com `stages`.
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
+    UpdateProjectRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+    AddStageRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        expectedDate:
+          $ref: '#/components/schemas/NullableCalendarDate'
+        position:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: Posição desejada (1 = primeira). Omitido = fim do fluxo.
+    UpdateStageRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+        expectedDate:
+          $ref: '#/components/schemas/NullableCalendarDate'
+    ReorderStagesRequest:
+      type: object
+      additionalProperties: false
+      required: [stageIds]
+      properties:
+        stageIds:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Uuid'
+    ReopenStageRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 500
+          description: Justificativa (registrada só na auditoria interna).
+
+    # ---------- Admin: notes & audit ----------
+    InternalNote:
+      type: object
+      required: [id, projectId, stageId, author, body, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        projectId:
+          $ref: '#/components/schemas/Uuid'
+        stageId:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        author:
+          $ref: '#/components/schemas/UserRef'
+        body:
+          type: string
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+    InternalNotePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InternalNote'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    CreateInternalNoteRequest:
+      type: object
+      additionalProperties: false
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 5000
+        stageId:
+          $ref: '#/components/schemas/Uuid'
+    AuditEvent:
+      type: object
+      required: [id, occurredAt, actor, action, entityType, entityId, clientId, projectId, metadata, requestId]
+      properties:
+        id:
+          type: string
+          description: Identificador sequencial (bigint serializado como string).
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+        actor:
+          description: Autor da ação; `null` = sistema.
+          oneOf:
+            - $ref: '#/components/schemas/UserRef'
+            - type: 'null'
+        action:
+          $ref: '#/components/schemas/AuditAction'
+        entityType:
+          type: string
+        entityId:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        clientId:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        projectId:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        metadata:
+          type: object
+          description: Dados adicionais sem PII (ex.. `reason` de reabertura, posições antigas/novas).
+          additionalProperties: true
+        requestId:
+          oneOf:
+            - type: string
+            - type: 'null'
+    AuditEventPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # ---------- Admin: templates (Onda 10) ----------
+    FlowTemplateStage:
+      type: object
+      required: [position, title, description]
+      properties:
+        position:
+          type: integer
+          minimum: 1
+          maximum: 50
+        title:
+          type: string
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+    FlowTemplate:
+      type: object
+      required: [id, name, stages, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        stages:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/FlowTemplateStage'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    FlowTemplateSummary:
+      type: object
+      required: [id, name, stageCount, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        stageCount:
+          type: integer
+          minimum: 0
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    FlowTemplatePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowTemplateSummary'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    TemplateStageInput:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/NullableDescription'
+    CreateFlowTemplateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, stages]
+      properties:
+        name:
+          $ref: '#/components/schemas/Title'
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/TemplateStageInput'
+    UpdateFlowTemplateRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          $ref: '#/components/schemas/Title'
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/TemplateStageInput'
